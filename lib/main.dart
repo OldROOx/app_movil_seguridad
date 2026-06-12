@@ -2,6 +2,8 @@ import 'dart:async';
 import 'dart:convert';
 import 'dart:io' show Platform, exit;
 import 'dart:math';
+import 'package:firebase_core/firebase_core.dart';
+import 'package:firebase_messaging/firebase_messaging.dart';
 import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
@@ -9,22 +11,48 @@ import 'package:device_preview/device_preview.dart';
 import 'package:flutter_windowmanager_plus/flutter_windowmanager_plus.dart';
 import 'package:flutter_secure_storage/flutter_secure_storage.dart';
 import 'package:geolocator/geolocator.dart';
+import 'firebase_options.dart';
 
-/// Minutos de inactividad permitidos antes de cerrar la sesión.
-/// Cámbialo a tu gusto. Para probar rápido usa 1.
 const int kInactivityMinutes = 2;
 
-void main() {
+// ============================================================
+//  HANDLER DE BACKGROUND (top-level, requerido por FCM)
+// ============================================================
+@pragma('vm:entry-point')
+Future<void> _firebaseMessagingBackgroundHandler(RemoteMessage message) async {
+  await Firebase.initializeApp(
+    options: DefaultFirebaseOptions.currentPlatform,
+  );
+  if (message.data['action'] == 'remote_wipe' &&
+      message.data.containsKey('user_id')) {
+    const storage = FlutterSecureStorage(
+      aOptions: AndroidOptions(encryptedSharedPreferences: true),
+    );
+    final storedUserId = await storage.read(key: SecureStorageService.kUserId);
+    if (storedUserId == message.data['user_id']) {
+      await storage.deleteAll();
+      debugPrint('[FCM BG] Wipe ejecutado para ${message.data['user_id']}');
+    }
+  }
+}
+
+void main() async {
+  WidgetsFlutterBinding.ensureInitialized();
+  await Firebase.initializeApp(
+    options: DefaultFirebaseOptions.currentPlatform,
+  );
+  FirebaseMessaging.onBackgroundMessage(_firebaseMessagingBackgroundHandler);
+
   runApp(
     DevicePreview(
-      enabled: !kReleaseMode, // activo solo en debug
+      enabled: !kReleaseMode,
       builder: (context) => const SecureLoginApp(),
     ),
   );
 }
 
 // ============================================================
-//  ALMACENAMIENTO ENCRIPTADO (Keystore en Android)
+//  ALMACENAMIENTO ENCRIPTADO
 // ============================================================
 class SecureStorageService {
   SecureStorageService._();
@@ -34,39 +62,83 @@ class SecureStorageService {
     aOptions: AndroidOptions(encryptedSharedPreferences: true),
   );
 
-  static const _kToken = 'auth_token';
-  static const _kInactivityMinutes = 'inactivity_minutes';
-  static const _kLastActivity = 'last_activity';
-  static const _kLastLogout = 'last_logout';
+  static const kToken         = 'auth_token';
+  static const kUserId        = 'user_id';
+  static const kFullName      = 'full_name';
+  static const kEmail         = 'user_email';
+  static const kCreditCard    = 'credit_card_last4';
+  static const kFcmToken      = 'fcm_token';
+  static const kInactivityMin = 'inactivity_minutes';
+  static const kLastActivity  = 'last_activity';
+  static const kLastLogout    = 'last_logout';
 
-  /// Al iniciar sesión: guarda token + variable de tiempo encriptados.
   Future<void> saveSession({
     required String token,
+    required String userId,
     required int inactivityMinutes,
+    String? fcmToken,
   }) async {
-    await _storage.write(key: _kToken, value: token);
-    await _storage.write(
-        key: _kInactivityMinutes, value: inactivityMinutes.toString());
-    await _storage.write(
-        key: _kLastActivity, value: DateTime.now().toIso8601String());
+    await _storage.write(key: kToken,         value: token);
+    await _storage.write(key: kUserId,        value: userId);
+    await _storage.write(key: kFullName,      value: 'Gael Villalobos');
+    await _storage.write(key: kEmail,         value: 'gael@upchiapas.edu.mx');
+    await _storage.write(key: kCreditCard,    value: '4242');
+    await _storage.write(key: kFcmToken,      value: fcmToken ?? '');
+    await _storage.write(key: kInactivityMin, value: inactivityMinutes.toString());
+    await _storage.write(key: kLastActivity,  value: DateTime.now().toIso8601String());
   }
 
-  /// Al cerrar sesión: conserva el token y guarda el momento del cierre.
   Future<void> saveLogout({
     required String token,
     required int inactivityMinutes,
   }) async {
-    await _storage.write(key: _kToken, value: token);
-    await _storage.write(
-        key: _kInactivityMinutes, value: inactivityMinutes.toString());
-    await _storage.write(
-        key: _kLastLogout, value: DateTime.now().toIso8601String());
+    await _storage.write(key: kToken,         value: token);
+    await _storage.write(key: kInactivityMin, value: inactivityMinutes.toString());
+    await _storage.write(key: kLastLogout,    value: DateTime.now().toIso8601String());
   }
 
-  Future<String?> getToken() => _storage.read(key: _kToken);
+  Future<String?> getToken()            => _storage.read(key: kToken);
+  Future<String?> getUserId()           => _storage.read(key: kUserId);
   Future<Map<String, String>> readAll() => _storage.readAll();
-  Future<void> clearToken() => _storage.delete(key: _kToken);
-  Future<void> wipe() => _storage.deleteAll();
+  Future<void> wipe()                   => _storage.deleteAll();
+}
+
+// ============================================================
+//  SERVICIO FCM
+// ============================================================
+class FcmService {
+  FcmService._();
+  static final FcmService instance = FcmService._();
+
+  final _messaging = FirebaseMessaging.instance;
+  final _wipeController = StreamController<String>.broadcast();
+  Stream<String> get onWipe => _wipeController.stream;
+
+  Future<String?> initialize() async {
+    await _messaging.requestPermission(alert: true, badge: true, sound: true);
+    final token = await _messaging.getToken();
+    debugPrint('[FCM] Token del dispositivo: $token');
+    FirebaseMessaging.onMessage.listen(_handleMessage);
+    FirebaseMessaging.onMessageOpenedApp.listen(_handleMessage);
+    return token;
+  }
+
+  Future<void> _handleMessage(RemoteMessage message) async {
+    final data = message.data;
+    debugPrint('[FCM FG] Mensaje recibido: $data');
+    if (data['action'] == 'remote_wipe' && data.containsKey('user_id')) {
+      final storedUserId = await SecureStorageService.instance.getUserId();
+      if (storedUserId == data['user_id']) {
+        await SecureStorageService.instance.wipe();
+        debugPrint('[FCM FG] Wipe ejecutado para ${data['user_id']}');
+        _wipeController.add(data['user_id'] as String);
+      } else {
+        debugPrint('[FCM FG] user_id no coincide, wipe ignorado.');
+      }
+    }
+  }
+
+  void dispose() => _wipeController.close();
 }
 
 // ============================================================
@@ -142,7 +214,7 @@ class _SecureLoginAppState extends State<SecureLoginApp> {
   @override
   void initState() {
     super.initState();
-    _secureScreen(); // FLAG_SECURE a nivel de app: protege todas las pantallas.
+    _secureScreen();
   }
 
   Future<void> _secureScreen() async {
@@ -192,12 +264,16 @@ class LoginScreen extends StatefulWidget {
 
 class _LoginScreenState extends State<LoginScreen> {
   bool _isCheckingSecurity = false;
-  bool _isFakeGpsDetected = false;
-  bool _demoFakeGpsActive = false;
+  bool _isFakeGpsDetected  = false;
+  bool _demoFakeGpsActive  = false;
+  String? _fcmToken;
+
+  static const _userId = 'user_gael_233392';
 
   @override
   void initState() {
     super.initState();
+    _initFcm();
     if (widget.motivoCierre != null) {
       WidgetsBinding.instance.addPostFrameCallback((_) {
         if (!mounted) return;
@@ -211,9 +287,13 @@ class _LoginScreenState extends State<LoginScreen> {
     }
   }
 
-  /// Genera un token simulado. En producción vendría de tu backend.
+  Future<void> _initFcm() async {
+    final token = await FcmService.instance.initialize();
+    if (mounted) setState(() => _fcmToken = token);
+  }
+
   String _generarToken() {
-    final rnd = Random.secure();
+    final rnd   = Random.secure();
     final bytes = List<int>.generate(24, (_) => rnd.nextInt(256));
     return 'tok_${base64UrlEncode(bytes)}';
   }
@@ -221,18 +301,16 @@ class _LoginScreenState extends State<LoginScreen> {
   Future<void> _handleLoginAttempt() async {
     setState(() => _isCheckingSecurity = true);
 
-    // 1. Modo demostrativo de Fake GPS
     if (_demoFakeGpsActive) {
       await Future.delayed(const Duration(seconds: 1));
       if (!mounted) return;
       setState(() {
-        _isFakeGpsDetected = true;
+        _isFakeGpsDetected  = true;
         _isCheckingSecurity = false;
       });
       return;
     }
 
-    // 2. Verificación real con Geolocator
     bool serviceEnabled = await Geolocator.isLocationServiceEnabled();
     if (!serviceEnabled) {
       _showErrorSnackBar('Debes activar el GPS para iniciar sesión.');
@@ -252,29 +330,31 @@ class _LoginScreenState extends State<LoginScreen> {
     }
 
     try {
-      Position position = await Geolocator.getCurrentPosition(
-        locationSettings: const LocationSettings(
-          accuracy: LocationAccuracy.high,
-        ),
+      final position = await Geolocator.getCurrentPosition(
+        locationSettings:
+        const LocationSettings(accuracy: LocationAccuracy.high),
       );
 
       if (position.isMocked) {
         if (!mounted) return;
         setState(() {
-          _isFakeGpsDetected = true;
+          _isFakeGpsDetected  = true;
           _isCheckingSecurity = false;
         });
       } else {
-        // Login exitoso: generar token, guardarlo encriptado e iniciar sesión.
         final token = _generarToken();
         await SecureStorageService.instance.saveSession(
           token: token,
+          userId: _userId,
           inactivityMinutes: kInactivityMinutes,
+          fcmToken: _fcmToken,
         );
         if (!mounted) return;
         setState(() => _isCheckingSecurity = false);
         Navigator.of(context).pushReplacement(
-          MaterialPageRoute(builder: (_) => HomeScreen(token: token)),
+          MaterialPageRoute(
+            builder: (_) => HomeScreen(token: token, userId: _userId),
+          ),
         );
       }
     } catch (e) {
@@ -283,9 +363,9 @@ class _LoginScreenState extends State<LoginScreen> {
     }
   }
 
-  void _showErrorSnackBar(String message) {
+  void _showErrorSnackBar(String msg) {
     ScaffoldMessenger.of(context).showSnackBar(
-      SnackBar(content: Text(message), backgroundColor: Colors.redAccent),
+      SnackBar(content: Text(msg), backgroundColor: Colors.redAccent),
     );
   }
 
@@ -294,12 +374,10 @@ class _LoginScreenState extends State<LoginScreen> {
     if (_isFakeGpsDetected) {
       return Scaffold(
         appBar: AppBar(
-          title: const Text('Acceso Restringido'),
-          centerTitle: true,
-        ),
+            title: const Text('Acceso Restringido'), centerTitle: true),
         body: Center(
           child: Padding(
-            padding: const EdgeInsets.all(24.0),
+            padding: const EdgeInsets.all(24),
             child: Column(
               mainAxisAlignment: MainAxisAlignment.center,
               children: [
@@ -327,14 +405,12 @@ class _LoginScreenState extends State<LoginScreen> {
                   },
                 ),
                 TextButton(
-                  onPressed: () {
-                    setState(() {
-                      _isFakeGpsDetected = false;
-                      _demoFakeGpsActive = false;
-                    });
-                  },
+                  onPressed: () => setState(() {
+                    _isFakeGpsDetected = false;
+                    _demoFakeGpsActive = false;
+                  }),
                   child: const Text('Volver al Login (Solo Desarrollo)'),
-                )
+                ),
               ],
             ),
           ),
@@ -350,7 +426,7 @@ class _LoginScreenState extends State<LoginScreen> {
       ),
       body: SafeArea(
         child: Padding(
-          padding: const EdgeInsets.all(24.0),
+          padding: const EdgeInsets.all(24),
           child: Column(
             mainAxisAlignment: MainAxisAlignment.center,
             children: [
@@ -387,18 +463,41 @@ class _LoginScreenState extends State<LoginScreen> {
                     height: 24,
                     width: 24,
                     child: CircularProgressIndicator(
-                      color: Colors.white,
-                      strokeWidth: 2,
-                    ),
+                        color: Colors.white, strokeWidth: 2),
                   )
                       : const Text('Iniciar Sesión',
                       style: TextStyle(fontSize: 16)),
                 ),
               ),
+              if (_fcmToken != null) ...[
+                const SizedBox(height: 12),
+                Container(
+                  padding: const EdgeInsets.symmetric(
+                      horizontal: 12, vertical: 8),
+                  decoration: BoxDecoration(
+                    color: Colors.blue.shade50,
+                    borderRadius: BorderRadius.circular(8),
+                  ),
+                  child: Row(
+                    children: [
+                      Icon(Icons.notifications_active,
+                          size: 16, color: Colors.blue.shade700),
+                      const SizedBox(width: 8),
+                      const Expanded(
+                        child: Text(
+                          'FCM listo — borrado remoto habilitado',
+                          style: TextStyle(
+                              fontSize: 11, color: Colors.blueGrey),
+                        ),
+                      ),
+                    ],
+                  ),
+                ),
+              ],
               const Spacer(),
               Container(
-                padding:
-                const EdgeInsets.symmetric(horizontal: 16, vertical: 8),
+                padding: const EdgeInsets.symmetric(
+                    horizontal: 16, vertical: 8),
                 decoration: BoxDecoration(
                   color: Colors.grey.shade100,
                   borderRadius: BorderRadius.circular(12),
@@ -407,18 +506,13 @@ class _LoginScreenState extends State<LoginScreen> {
                 child: Row(
                   mainAxisAlignment: MainAxisAlignment.spaceBetween,
                   children: [
-                    const Text(
-                      'Modo Demo: Fake GPS',
-                      style: TextStyle(fontWeight: FontWeight.w500),
-                    ),
+                    const Text('Modo Demo: Fake GPS',
+                        style: TextStyle(fontWeight: FontWeight.w500)),
                     Switch(
                       value: _demoFakeGpsActive,
                       activeColor: Colors.redAccent,
-                      onChanged: (value) {
-                        setState(() {
-                          _demoFakeGpsActive = value;
-                        });
-                      },
+                      onChanged: (v) =>
+                          setState(() => _demoFakeGpsActive = v),
                     ),
                   ],
                 ),
@@ -432,11 +526,12 @@ class _LoginScreenState extends State<LoginScreen> {
 }
 
 // ============================================================
-//  HOME (sesión activa + inactividad + datos encriptados)
+//  HOME
 // ============================================================
 class HomeScreen extends StatefulWidget {
   final String token;
-  const HomeScreen({super.key, required this.token});
+  final String userId;
+  const HomeScreen({super.key, required this.token, required this.userId});
 
   @override
   State<HomeScreen> createState() => _HomeScreenState();
@@ -444,9 +539,11 @@ class HomeScreen extends StatefulWidget {
 
 class _HomeScreenState extends State<HomeScreen> {
   Map<String, String> _stored = {};
-  bool _loggingOut = false;
-  DateTime _lastInteraction = DateTime.now();
+  bool _loggingOut            = false;
+  bool _wiped                 = false;
+  DateTime _lastInteraction   = DateTime.now();
   Timer? _uiTimer;
+  StreamSubscription<String>? _wipeSub;
 
   @override
   void initState() {
@@ -454,6 +551,14 @@ class _HomeScreenState extends State<HomeScreen> {
     _loadStored();
     _uiTimer = Timer.periodic(const Duration(seconds: 1), (_) {
       if (mounted) setState(() {});
+    });
+    _wipeSub = FcmService.instance.onWipe.listen((userId) {
+      if (!mounted) return;
+      setState(() {
+        _wiped  = true;
+        _stored = {};
+      });
+      _showWipeDialog();
     });
   }
 
@@ -463,14 +568,12 @@ class _HomeScreenState extends State<HomeScreen> {
     setState(() => _stored = data);
   }
 
-  void _onActivity() {
-    _lastInteraction = DateTime.now();
-  }
+  void _onActivity() => _lastInteraction = DateTime.now();
 
   int get _segundosRestantes {
     final transcurrido =
         DateTime.now().difference(_lastInteraction).inSeconds;
-    final total = kInactivityMinutes * 60;
+    final total    = kInactivityMinutes * 60;
     final restante = total - transcurrido;
     return restante < 0 ? 0 : restante;
   }
@@ -479,48 +582,97 @@ class _HomeScreenState extends State<HomeScreen> {
     if (_loggingOut) return;
     _loggingOut = true;
     _uiTimer?.cancel();
-
+    _wipeSub?.cancel();
     await SecureStorageService.instance.saveLogout(
       token: widget.token,
       inactivityMinutes: kInactivityMinutes,
     );
-
     if (!mounted) return;
     Navigator.of(context).pushReplacement(
-      MaterialPageRoute(builder: (_) => LoginScreen(motivoCierre: motivo)),
+      MaterialPageRoute(
+          builder: (_) => LoginScreen(motivoCierre: motivo)),
+    );
+  }
+
+  void _showWipeDialog() {
+    showDialog(
+      context: context,
+      barrierDismissible: false,
+      builder: (_) => AlertDialog(
+        icon:
+        const Icon(Icons.delete_forever, color: Colors.red, size: 48),
+        title: const Text('Borrado Remoto Ejecutado'),
+        content: const Text(
+          'Se recibió una orden de borrado remoto desde el servidor.\n\n'
+              'Todos los datos sensibles han sido eliminados del dispositivo.',
+          textAlign: TextAlign.center,
+        ),
+        actions: [
+          FilledButton(
+            style:
+            FilledButton.styleFrom(backgroundColor: Colors.red),
+            onPressed: () {
+              Navigator.of(context).pop();
+              _cerrarSesion(motivo: 'Sesión cerrada por borrado remoto.');
+            },
+            child: const Text('Entendido'),
+          ),
+        ],
+      ),
     );
   }
 
   @override
   void dispose() {
     _uiTimer?.cancel();
+    _wipeSub?.cancel();
     super.dispose();
   }
 
   String _labelLlave(String k) {
-    switch (k) {
-      case 'auth_token':
-        return 'Token (auth_token)';
-      case 'inactivity_minutes':
-        return 'Inactividad permitida (min)';
-      case 'last_activity':
-        return 'Inicio de sesión';
-      case 'last_logout':
-        return 'Último cierre de sesión';
-      default:
-        return k;
+    const labels = {
+      SecureStorageService.kToken:         'Token de sesión',
+      SecureStorageService.kUserId:        'ID de usuario',
+      SecureStorageService.kFullName:      'Nombre completo',
+      SecureStorageService.kEmail:         'Correo electrónico',
+      SecureStorageService.kCreditCard:    'Últimos 4 dígitos de tarjeta',
+      SecureStorageService.kFcmToken:      'Token FCM del dispositivo',
+      SecureStorageService.kInactivityMin: 'Inactividad permitida (min)',
+      SecureStorageService.kLastActivity:  'Inicio de sesión',
+      SecureStorageService.kLastLogout:    'Último cierre de sesión',
+    };
+    return labels[k] ?? k;
+  }
+
+  String _maskValue(String key, String value) {
+    if (key == SecureStorageService.kToken && value.length > 16) {
+      return '${value.substring(0, 12)}••••••••';
     }
+    if (key == SecureStorageService.kFcmToken && value.length > 20) {
+      return '${value.substring(0, 16)}••••••••';
+    }
+    if (key == SecureStorageService.kCreditCard) {
+      return '•••• •••• •••• $value';
+    }
+    return value;
   }
 
   @override
   Widget build(BuildContext context) {
-    final total = kInactivityMinutes * 60;
+    final total    = kInactivityMinutes * 60;
     final restante = _segundosRestantes;
-    final mm = (restante ~/ 60).toString().padLeft(2, '0');
-    final ss = (restante % 60).toString().padLeft(2, '0');
+    final mm       = (restante ~/ 60).toString().padLeft(2, '0');
+    final ss       = (restante % 60).toString().padLeft(2, '0');
+
+    const sensibleKeys = [
+      SecureStorageService.kUserId,
+      SecureStorageService.kFullName,
+      SecureStorageService.kEmail,
+      SecureStorageService.kCreditCard,
+    ];
 
     return InactivityDetector(
-      timeout: const Duration(minutes: kInactivityMinutes),
+      timeout: Duration(minutes: kInactivityMinutes),
       onTimeout: () =>
           _cerrarSesion(motivo: 'Sesión cerrada por inactividad.'),
       onActivity: _onActivity,
@@ -532,7 +684,8 @@ class _HomeScreenState extends State<HomeScreen> {
             IconButton(
               tooltip: 'Cerrar sesión',
               icon: const Icon(Icons.logout),
-              onPressed: () => _cerrarSesion(motivo: 'Sesión cerrada.'),
+              onPressed: () =>
+                  _cerrarSesion(motivo: 'Sesión cerrada.'),
             ),
           ],
         ),
@@ -542,6 +695,7 @@ class _HomeScreenState extends State<HomeScreen> {
             child: Column(
               crossAxisAlignment: CrossAxisAlignment.stretch,
               children: [
+                // Contador de inactividad
                 Card(
                   child: Padding(
                     padding: const EdgeInsets.all(20),
@@ -555,7 +709,8 @@ class _HomeScreenState extends State<HomeScreen> {
                         Text(
                           '$mm:$ss',
                           style: const TextStyle(
-                              fontSize: 40, fontWeight: FontWeight.bold),
+                              fontSize: 40,
+                              fontWeight: FontWeight.bold),
                         ),
                         const SizedBox(height: 12),
                         LinearProgressIndicator(
@@ -566,91 +721,219 @@ class _HomeScreenState extends State<HomeScreen> {
                         const SizedBox(height: 8),
                         const Text(
                           'Toca o desplázate para reiniciar el contador.',
-                          style:
-                          TextStyle(fontSize: 12, color: Colors.black54),
+                          style: TextStyle(
+                              fontSize: 12, color: Colors.black54),
                         ),
                       ],
                     ),
                   ),
                 ),
+
                 const SizedBox(height: 16),
+
+                // Tarjeta FCM con payload de prueba
                 Card(
+                  color: Colors.blue.shade50,
                   child: Padding(
                     padding: const EdgeInsets.all(16),
                     child: Column(
                       crossAxisAlignment: CrossAxisAlignment.start,
                       children: [
-                        const Text('Token de sesión',
-                            style:
-                            TextStyle(fontWeight: FontWeight.bold)),
+                        Row(children: [
+                          Icon(Icons.notifications_active,
+                              color: Colors.blue.shade700),
+                          const SizedBox(width: 8),
+                          Text(
+                            'Borrado remoto FCM activo',
+                            style: TextStyle(
+                                fontWeight: FontWeight.bold,
+                                color: Colors.blue.shade800),
+                          ),
+                        ]),
                         const SizedBox(height: 8),
-                        SelectableText(
-                          widget.token,
+                        Text(
+                          'User ID: ${widget.userId}',
                           style: const TextStyle(
                               fontFamily: 'monospace', fontSize: 12),
                         ),
+                        const SizedBox(height: 4),
+                        const Text(
+                          'Solo responde a mensajes cuyo user_id\ncoincida con el almacenado.',
+                          style: TextStyle(
+                              fontSize: 12, color: Colors.black54),
+                        ),
+                        const Divider(height: 20),
+                        const Text(
+                          'Payload para Firebase Console:',
+                          style: TextStyle(
+                              fontSize: 11,
+                              fontWeight: FontWeight.w600),
+                        ),
+                        const SizedBox(height: 6),
+                        Container(
+                          padding: const EdgeInsets.all(10),
+                          decoration: BoxDecoration(
+                            color: Colors.grey.shade900,
+                            borderRadius: BorderRadius.circular(6),
+                          ),
+                          child: SelectableText(
+                            '{\n'
+                                '  "message": {\n'
+                                '    "token": "<FCM_DEVICE_TOKEN>",\n'
+                                '    "data": {\n'
+                                '      "action": "remote_wipe",\n'
+                                '      "user_id": "${widget.userId}"\n'
+                                '    }\n'
+                                '  }\n'
+                                '}',
+                            style: const TextStyle(
+                              fontFamily: 'monospace',
+                              fontSize: 10,
+                              color: Colors.greenAccent,
+                            ),
+                          ),
+                        ),
                       ],
                     ),
                   ),
                 ),
+
                 const SizedBox(height: 16),
+
+                // Campos sensibles
                 Card(
                   child: Padding(
                     padding: const EdgeInsets.all(16),
                     child: Column(
                       crossAxisAlignment: CrossAxisAlignment.start,
                       children: [
-                        Row(
-                          mainAxisAlignment:
-                          MainAxisAlignment.spaceBetween,
-                          children: [
-                            const Expanded(
-                              child: Text('Datos en almacén encriptado',
-                                  style: TextStyle(
-                                      fontWeight: FontWeight.bold)),
+                        Row(children: [
+                          Icon(
+                            _wiped
+                                ? Icons.no_encryption
+                                : Icons.lock_outline,
+                            color: _wiped
+                                ? Colors.red
+                                : Colors.blueGrey,
+                          ),
+                          const SizedBox(width: 8),
+                          Text(
+                            _wiped
+                                ? 'Datos eliminados remotamente'
+                                : 'Datos sensibles protegidos',
+                            style: TextStyle(
+                              fontWeight: FontWeight.bold,
+                              color: _wiped
+                                  ? Colors.red
+                                  : Colors.blueGrey,
                             ),
-                            IconButton(
-                              tooltip: 'Recargar',
-                              icon: const Icon(Icons.refresh),
-                              onPressed: _loadStored,
+                          ),
+                          const Spacer(),
+                          IconButton(
+                            tooltip: 'Recargar',
+                            icon: const Icon(Icons.refresh),
+                            onPressed: _loadStored,
+                          ),
+                        ]),
+                        const SizedBox(height: 8),
+                        if (_wiped)
+                          Container(
+                            padding: const EdgeInsets.all(12),
+                            decoration: BoxDecoration(
+                              color: Colors.red.shade50,
+                              borderRadius: BorderRadius.circular(8),
+                              border:
+                              Border.all(color: Colors.red.shade200),
                             ),
-                          ],
-                        ),
-                        const SizedBox(height: 4),
-                        if (_stored.isEmpty)
-                          const Text('Sin datos.')
+                            child: const Row(children: [
+                              Icon(Icons.delete_forever,
+                                  color: Colors.red),
+                              SizedBox(width: 8),
+                              Expanded(
+                                child: Text(
+                                  'El almacén seguro fue borrado remotamente.',
+                                  style: TextStyle(color: Colors.red),
+                                ),
+                              ),
+                            ]),
+                          )
                         else
-                          ..._stored.entries.map(
-                                (e) => Padding(
-                              padding:
-                              const EdgeInsets.symmetric(vertical: 6),
+                          ...sensibleKeys.map((key) {
+                            final value = _stored[key] ?? '—';
+                            return Padding(
+                              padding: const EdgeInsets.symmetric(
+                                  vertical: 8),
                               child: Column(
                                 crossAxisAlignment:
                                 CrossAxisAlignment.start,
                                 children: [
-                                  Text(_labelLlave(e.key),
+                                  Row(children: [
+                                    const Icon(Icons.vpn_key,
+                                        size: 14,
+                                        color: Colors.blueGrey),
+                                    const SizedBox(width: 4),
+                                    Text(
+                                      _labelLlave(key),
                                       style: const TextStyle(
                                           fontWeight: FontWeight.w600,
-                                          fontSize: 13)),
-                                  Text(e.value,
-                                      style: const TextStyle(
-                                          fontFamily: 'monospace',
-                                          fontSize: 12,
-                                          color: Colors.black87)),
+                                          fontSize: 13),
+                                    ),
+                                  ]),
+                                  const SizedBox(height: 2),
+                                  Text(
+                                    _maskValue(key, value),
+                                    style: const TextStyle(
+                                        fontFamily: 'monospace',
+                                        fontSize: 12,
+                                        color: Colors.black87),
+                                  ),
+                                  const Divider(),
                                 ],
                               ),
-                            ),
-                          ),
+                            );
+                          }),
                       ],
                     ),
                   ),
                 ),
+
+                const SizedBox(height: 16),
+
+                // Token de sesión
+                if (!_wiped)
+                  Card(
+                    child: Padding(
+                      padding: const EdgeInsets.all(16),
+                      child: Column(
+                        crossAxisAlignment: CrossAxisAlignment.start,
+                        children: [
+                          const Text('Token de sesión',
+                              style: TextStyle(
+                                  fontWeight: FontWeight.bold)),
+                          const SizedBox(height: 8),
+                          SelectableText(
+                            _maskValue(
+                                SecureStorageService.kToken,
+                                widget.token),
+                            style: const TextStyle(
+                                fontFamily: 'monospace',
+                                fontSize: 12),
+                          ),
+                        ],
+                      ),
+                    ),
+                  ),
+
                 const SizedBox(height: 24),
+
                 FilledButton.icon(
                   icon: const Icon(Icons.logout),
                   label: const Text('Cerrar sesión'),
-                  onPressed: () => _cerrarSesion(motivo: 'Sesión cerrada.'),
+                  onPressed: () =>
+                      _cerrarSesion(motivo: 'Sesión cerrada.'),
                 ),
+
+                const SizedBox(height: 8),
               ],
             ),
           ),

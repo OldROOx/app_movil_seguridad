@@ -1,4 +1,4 @@
-package com.diedgo.practica1
+package com.gael.movil
 
 import io.flutter.embedding.android.FlutterActivity
 

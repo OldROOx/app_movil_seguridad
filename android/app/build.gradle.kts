@@ -2,6 +2,7 @@ plugins {
     id("com.android.application")
     id("kotlin-android")
     id("dev.flutter.flutter-gradle-plugin")
+    id("com.google.gms.google-services")
 }
 
 android {
@@ -20,7 +21,6 @@ android {
 
     defaultConfig {
         applicationId = "com.gael.movil"
-        // flutter_secure_storage (EncryptedSharedPreferences) requiere API 23+
         minSdk = flutter.minSdkVersion
         targetSdk = flutter.targetSdkVersion
         versionCode = flutter.versionCode
