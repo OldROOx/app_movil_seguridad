@@ -240,10 +240,10 @@ class _SecureLoginAppState extends State<SecureLoginApp> {
   @override
   void initState() {
     super.initState();
-    _secureScreen();
+   // _secureScreen();
     _runRaspCheck();
   }
-
+/*
   Future<void> _secureScreen() async {
     if (!kIsWeb && Platform.isAndroid) {
       try {
@@ -255,6 +255,8 @@ class _SecureLoginAppState extends State<SecureLoginApp> {
       }
     }
   }
+
+ */
 
   // Verificación RASP: bloquea la app si ADB está activo,
   // excepto cuando se corre en modo debug (kDebugMode) para no
