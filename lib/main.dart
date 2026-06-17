@@ -16,6 +16,29 @@ import 'firebase_options.dart';
 const int kInactivityMinutes = 2;
 
 // ============================================================
+//  CANAL DE SEGURIDAD NATIVO (RASP - Detección de ADB)
+// ============================================================
+class SecurityChannel {
+  SecurityChannel._();
+  static const MethodChannel _channel =
+  MethodChannel('com.gael.movil/security');
+
+  /// Consulta a Kotlin si Settings.Global.ADB_ENABLED está activo.
+  /// Devuelve false si no es Android o si ocurre cualquier error.
+  static Future<bool> isUsbDebuggingEnabled() async {
+    if (!Platform.isAndroid) return false;
+    try {
+      final bool? result =
+      await _channel.invokeMethod<bool>('isUsbDebuggingEnabled');
+      return result ?? false;
+    } on PlatformException catch (e) {
+      debugPrint('[RASP] Error al consultar ADB: ${e.message}');
+      return false;
+    }
+  }
+}
+
+// ============================================================
 //  HANDLER DE BACKGROUND (top-level, requerido por FCM)
 // ============================================================
 @pragma('vm:entry-point')
@@ -211,10 +234,14 @@ class SecureLoginApp extends StatefulWidget {
 }
 
 class _SecureLoginAppState extends State<SecureLoginApp> {
+  bool _checkingEnvironment = true;
+  bool _adbBlocked = false;
+
   @override
   void initState() {
     super.initState();
     _secureScreen();
+    _runRaspCheck();
   }
 
   Future<void> _secureScreen() async {
@@ -227,6 +254,24 @@ class _SecureLoginAppState extends State<SecureLoginApp> {
         debugPrint('No se pudo aplicar FLAG_SECURE: $e');
       }
     }
+  }
+
+  // Verificación RASP: bloquea la app si ADB está activo,
+  // excepto cuando se corre en modo debug (kDebugMode) para no
+  // estorbar el flujo normal de desarrollo.
+  Future<void> _runRaspCheck() async {
+    if (kDebugMode) {
+      setState(() => _checkingEnvironment = false);
+      return;
+    }
+
+    final adbEnabled = await SecurityChannel.isUsbDebuggingEnabled();
+
+    if (!mounted) return;
+    setState(() {
+      _checkingEnvironment = false;
+      _adbBlocked = adbEnabled;
+    });
   }
 
   @override
@@ -246,7 +291,78 @@ class _SecureLoginAppState extends State<SecureLoginApp> {
           fillColor: Colors.grey.shade50,
         ),
       ),
-      home: const LoginScreen(),
+      home: _checkingEnvironment
+          ? const Scaffold(body: Center(child: CircularProgressIndicator()))
+          : (_adbBlocked ? const AdbBlockedScreen() : const LoginScreen()),
+    );
+  }
+}
+
+// ============================================================
+//  PANTALLA DE BLOQUEO POR DEPURACIÓN USB (RASP)
+// ============================================================
+class AdbBlockedScreen extends StatelessWidget {
+  const AdbBlockedScreen({super.key});
+
+  @override
+  Widget build(BuildContext context) {
+    return Scaffold(
+      body: SafeArea(
+        child: Center(
+          child: Padding(
+            padding: const EdgeInsets.all(24),
+            child: Builder(
+              builder: (context) {
+                WidgetsBinding.instance.addPostFrameCallback((_) {
+                  _showBlockingDialog(context);
+                });
+                return const Icon(
+                  Icons.gpp_bad,
+                  size: 80,
+                  color: Colors.redAccent,
+                );
+              },
+            ),
+          ),
+        ),
+      ),
+    );
+  }
+
+  void _showBlockingDialog(BuildContext context) {
+    showDialog(
+      context: context,
+      barrierDismissible: false,
+      builder: (dialogContext) {
+        return PopScope(
+          canPop: false,
+          child: AlertDialog(
+            icon: const Icon(Icons.gpp_bad, color: Colors.red, size: 40),
+            title: const Text('Entorno no seguro detectado'),
+            content: const Text(
+              'Esta aplicación ha detectado que la Depuración USB '
+                  '(USB Debugging) está activa en este dispositivo.\n\n'
+                  'Por políticas de seguridad de la información, no es posible '
+                  'continuar mientras esta opción esté habilitada, ya que '
+                  'representa un riesgo de intercepción y manipulación de datos.\n\n'
+                  'Por favor, desactiva la Depuración USB desde:\n'
+                  'Ajustes > Opciones de desarrollador > Depuración USB.',
+            ),
+            actions: [
+              TextButton(
+                onPressed: () {
+                  if (Platform.isAndroid) {
+                    SystemNavigator.pop();
+                  } else {
+                    exit(0);
+                  }
+                },
+                child: const Text('Cerrar aplicación'),
+              ),
+            ],
+          ),
+        );
+      },
     );
   }
 }
